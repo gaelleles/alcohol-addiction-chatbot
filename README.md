@@ -31,4 +31,4 @@ I encourage you to build a library that is mindful of the intellectual property 
 
 # Tech challenges
 
-"J'ai d'abord utilisé FAISS, mais j'ai rencontré un problème de segmentation/indexation avec l'interpréteur Python 3.13 et NumPy 2.0. J'ai donc dû debugger la couche d'abstraction de LangChain pour implémenter soit une injection manuelle via from_texts, soit basculer sur ChromaDB pour assurer la stabilité du système."
+I initially used FAISS, but I ran into a segmentation/indexing issue with Python 3.13 and NumPy 2.0. So I had to debug LangChain’s abstraction layer to either implement manual injection via `from_texts` or switch to ChromaDB to ensure the system’s stability.
