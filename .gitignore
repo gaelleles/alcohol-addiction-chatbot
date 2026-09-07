@@ -142,6 +142,9 @@ env/
 venv/
 ENV/
 env.bak/
+
+# Persisted vector store cache (regenerable from pdf_papers/)
+.chroma_cache/
 venv.bak/
 
 # Spyder project settings
