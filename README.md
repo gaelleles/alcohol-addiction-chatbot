@@ -9,7 +9,7 @@ Ask a question in natural language, and the chatbot answers using only the conte
 
 This is a **Retrieval-Augmented Generation (RAG)** pipeline: instead of asking a general-purpose LLM to answer from its own training data (which knows nothing about this specific, non-public paper collection and would be prone to hallucinating), the app retrieves the most relevant passages from the actual documents and asks the LLM to answer strictly from that retrieved context, citing sources.
 
-The pipeline, step by step (see `app.py`):
+The pipeline, step by step (see `rag_pipeline.py`, shared by the Streamlit app and the [evaluation harness](#evaluation)):
 
 1. **Ingestion** — `DirectoryLoader` + `PyPDFLoader` (LangChain) read every PDF in the configured folder (see [Privacy](#privacy--ip) below), page by page.
 2. **Chunking** — `RecursiveCharacterTextSplitter` splits the extracted text into chunks of **500 characters with 50 characters of overlap**. Smaller chunks make retrieval more precise (less irrelevant text gets pulled in alongside the relevant part); the overlap prevents an idea from being cleanly severed at a chunk boundary.
@@ -35,7 +35,7 @@ curl -s https://api.groq.com/openai/v1/models \
   -H "Authorization: Bearer $API_SERVICE_KEY" | python3 -m json.tool
 ```
 
-Then update `model_name="..."` in `app.py` (where `ChatGroq` is instantiated) to a chat-capable model from that list.
+Then update `CHAT_MODEL_NAME` in `rag_pipeline.py` to a chat-capable model from that list.
 
 # Setup
 
@@ -89,8 +89,56 @@ rm -rf .chroma_cache/public   # or .chroma_cache/private
 
 For quick iteration on the app itself (not the retrieval quality), testing with `PRIVACY=public` is by far the fastest option, since the corpus is tiny.
 
+# Evaluation
+
+Getting an answer back from the chatbot doesn't tell you whether that answer is any good — RAG can silently fail in two independent places: retrieval can pull the wrong passages, or the LLM can generate an answer not actually supported by the passages it was given (hallucination), even when retrieval worked fine. [`eval/evaluate.py`](eval/evaluate.py) runs the real `rag_chain` (the same code the app uses, via `rag_pipeline.py`) against a small hand-written gold question set ([`eval/testset.py`](eval/testset.py)) grounded in `pdf_papers/public/`, and scores it with four [RAGAS](https://github.com/explodinggradients/ragas) metrics:
+
+| Metric | Answers |
+|---|---|
+| `faithfulness` | Does the answer only assert things actually supported by the retrieved context? (catches hallucination) |
+| `answer_relevancy` | Does the answer actually address the question asked? |
+| `context_precision` | Is the retrieved context relevant to the question, with the most useful chunks ranked first? |
+| `context_recall` | Did retrieval surface the information needed to produce a correct answer? |
+
+Run it with:
+
+```bash
+uv run python eval/evaluate.py
+```
+
+## Judge model
+
+RAGAS needs an LLM to *judge* the RAG chain's answers — a separate role from the chat model being evaluated. It's tempting to reuse the same Groq model the app uses (`openai/gpt-oss-20b`), but that model turned out to be an unreliable judge: `gpt-oss` is a reasoning model, and on RAGAS' stricter structured-output schemas it would intermittently leak its chain-of-thought into the response instead of emitting a clean tool call, failing anywhere from 1 in 3 to 3 in 3 attempts depending on the metric. `qwen/qwen3.8-27b` was tested and found reliable (identical scores across repeated runs of all four metrics), so it's used as the judge instead — a good general lesson: **the judge model matters as much as the model being evaluated, and needs its own reliability check**, not just a hope that "any chat model" can fill that role. See the comments in `eval/evaluate.py::build_judge_llm` for the exact `instructor` mode this required.
+
+## Known constraints of running this on a free tier
+
+- **Output-token budget**: some longer, more information-dense answers require the judge to decompose many atomic statements (each with a verdict and reasoning), which can exceed this Groq account's free-tier output-tokens-per-minute limit for the judge model. When a metric can't be scored after a few retries, the harness records it as `n/a` and excludes it from the averages rather than crashing the whole run — see `score_with_retries` in `eval/evaluate.py`.
+- **Transient network blocks**: this project occasionally hits a `403 Access denied` from Groq that clears up on its own after a while (see the "Tech challenges" section for the same issue affecting the app itself). If a run fails outright with this error, it's Groq/network, not the harness — just retry later.
+
+## Sample output
+
+From a real run against the public corpus (your own numbers will vary slightly, since the judge is itself an LLM):
+
+```
+Q: How much higher is the rate of alcoholism among Native Americans compared to the U.S. average?
+  faithfulness       1.000
+  answer_relevancy   0.926
+  context_precision  1.000
+  context_recall     0.500
+
+Q: Why does women's drinking warrant serious attention from researchers even though women consume less alcohol than men?
+  faithfulness       0.400
+  answer_relevancy   0.798
+  context_precision  1.000
+  context_recall     1.000
+```
+
+That `context_recall: 0.500` and `faithfulness: 0.400` are genuinely useful signal, not just numbers to wave at — they're pointing at real, inspectable weaknesses: a `context_recall` below 1.0 means the retriever didn't surface every fact needed to fully answer that question (a chunking/retrieval-tuning problem), while a low `faithfulness` means the LLM asserted something in its answer that the retrieved chunks didn't actually support (a prompting/hallucination problem) — and `eval/results.json` (written after each run) has the full per-statement judge reasoning behind every score, so you can go read exactly which claim failed and why instead of guessing.
+
 # Tech challenges
 
 I initially used FAISS, but I ran into a segmentation/indexing issue with Python 3.13 and NumPy 2.0. So I had to debug LangChain's abstraction layer to either implement manual injection via `from_texts` or switch to ChromaDB to ensure the system's stability.
 
 Encrypted PDFs (AES) require the `cryptography` package for `pypdf` to be able to decrypt and extract their text — if you see `pypdf.errors.DependencyError: cryptography>=3.1 is required for AES algorithm`, make sure dependencies are installed via `uv sync` (this is already declared in `pyproject.toml`).
+
+Occasionally Groq returns `groq.PermissionDeniedError: Error code: 403 - Access denied. Please check your network settings.` for every request, including ones that authenticate and work fine minutes later. This looks like a transient, IP-based restriction on Groq's side rather than anything wrong with the API key or the code — if you hit it, the API key reaches Groq fine (confirmed by getting an actual error back instead of an auth failure), so just wait and retry rather than re-checking `.env`.
