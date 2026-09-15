@@ -19,3 +19,8 @@ dependencies = [
     "sentence-transformers>=5.2.0",
     "streamlit>=1.52.2",
 ]
+
+[dependency-groups]
+dev = [
+    "ragas>=0.4.3",
+]
