@@ -22,5 +22,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
     "ragas>=0.4.3",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

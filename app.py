@@ -1,27 +1,42 @@
-import streamlit as st
 import os
+
+import streamlit as st
 from dotenv import load_dotenv
 
 import rag_pipeline
 
 load_dotenv()
 
+st.set_page_config(page_title="DS Research Assistant", layout="wide")
+
 # --- CONFIGURATION ---
-PRIVACY = os.getenv("PRIVACY")
 API_SERVICE_KEY = os.getenv("API_SERVICE_KEY")
+if not API_SERVICE_KEY:
+    st.error(
+        "Error: the API key was not found in the .env file. "
+        "Set it up as described in the README."
+    )
+    st.stop()
+
+try:
+    PRIVACY = rag_pipeline.normalize_privacy(os.getenv("PRIVACY"))
+except ValueError as e:
+    st.error(f"Configuration error: {e}")
+    st.stop()
+
 PDF_DIRECTORY = rag_pipeline.get_pdf_directory(PRIVACY)
 CHROMA_PERSIST_DIRECTORY = rag_pipeline.get_persist_directory(PRIVACY)
 
-st.set_page_config(page_title="DS Research Assistant", layout="wide")
-
-if not API_SERVICE_KEY:
-    st.error("Erreur : La clé API n'a pas été trouvée dans le fichier .env. Configurez-la selon le README.")
-    st.stop()
 
 @st.cache_resource
-def init_knowledge_base():
+def init_rag_chain():
     embeddings = rag_pipeline.build_embeddings()
-    return rag_pipeline.build_vectorstore(PDF_DIRECTORY, CHROMA_PERSIST_DIRECTORY, embeddings)
+    vectorstore = rag_pipeline.build_vectorstore(
+        PDF_DIRECTORY, CHROMA_PERSIST_DIRECTORY, embeddings
+    )
+    llm = rag_pipeline.build_llm(API_SERVICE_KEY)
+    return rag_pipeline.build_rag_chain(vectorstore, llm)
+
 
 st.title("📚 Research Assistant")
 
@@ -29,13 +44,10 @@ if not os.path.exists(PDF_DIRECTORY):
     st.error(f"Can't find folder '{PDF_DIRECTORY}'.")
 else:
     try:
-        vectorstore = init_knowledge_base()
+        rag_chain = init_rag_chain()
     except ValueError as e:
         st.error(f"❌ {e}")
         st.stop()
-
-    llm = rag_pipeline.build_llm(API_SERVICE_KEY)
-    rag_chain = rag_pipeline.build_rag_chain(vectorstore, llm)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -61,15 +73,13 @@ else:
             answer = result["answer"]
             st.write(answer)
 
-            sources_utilisees = rag_pipeline.format_sources(result["context"])
+            sources = rag_pipeline.format_sources(result["context"])
 
-            if sources_utilisees:
+            if sources:
                 st.markdown("**📍 Files accessed for this answer:**")
-                for s in sources_utilisees:
+                for s in sources:
                     st.caption(s)
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "sources": sources_utilisees,
-        })
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer, "sources": sources}
+        )
