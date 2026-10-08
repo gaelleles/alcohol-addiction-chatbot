@@ -7,26 +7,26 @@ Ask a question in natural language, and the chatbot answers using only the conte
 
 # How it works
 
-This is a **Retrieval-Augmented Generation (RAG)** pipeline: instead of asking a general-purpose LLM to answer from its own training data (which knows nothing about this specific, non-public paper collection and would be prone to hallucinating), the app retrieves the most relevant passages from the actual documents and asks the LLM to answer strictly from that retrieved context, citing sources.
+This is a **Retrieval-Augmented Generation (RAG)** pipeline.
 
 The pipeline, step by step (see `rag_pipeline.py`, shared by the Streamlit app and the [evaluation harness](#evaluation)):
 
 1. **Ingestion** — `DirectoryLoader` + `PyPDFLoader` (LangChain) read every PDF in the configured folder (see [Privacy](#privacy--ip) below), page by page.
-2. **Chunking** — `RecursiveCharacterTextSplitter` splits the extracted text into chunks of **500 characters with 50 characters of overlap**. Smaller chunks make retrieval more precise (less irrelevant text gets pulled in alongside the relevant part); the overlap prevents an idea from being cleanly severed at a chunk boundary.
-3. **Embedding** — each chunk is turned into a vector with a local embedding model (see [Models used](#models-used)), so no external API call or cost is needed for this step.
+2. **Chunking** — `RecursiveCharacterTextSplitter` splits the extracted text into chunks. 
+3. **Embedding** — each chunk is turned into a vector with a local embedding model (see [Models used](#models-used)).
 4. **Indexing** — the vectors are stored in a local **ChromaDB** vector store, persisted to disk under `.chroma_cache/` so this step doesn't have to be repeated on every restart. The cache is tied to a fingerprint of the PDFs (names, sizes, modification times) and is rebuilt automatically when they change (see [Speeding up local testing](#speeding-up-local-testing)).
 5. **Retrieval** — when a question comes in, it's embedded with the same model and matched against the index to pull the top-k most similar chunks (`k=4`, LangChain's default, made explicit as `RETRIEVAL_K` in `rag_pipeline.py`).
 6. **Generation** — the retrieved chunks are "stuffed" directly into the system prompt as `{context}`, and an LLM (see [Models used](#models-used)) answers the question using only that context, listing which sources it used.
 7. **Source display** — each retrieved chunk carries metadata (source filename + page number), which the app deduplicates and displays under "Files accessed for this answer" so every answer is auditable against the literature.
 
-The chat itself is a proper multi-turn interface (`st.chat_input` / `st.chat_message`, backed by `st.session_state`): the conversation persists as a scrollable history rather than resetting on every question. Note that each question is still retrieved independently — the retriever doesn't currently use prior turns as context, so a follow-up like "what about women specifically?" won't automatically inherit the topic of the previous question.
+The chat itself is a proper multi-turn interface (`st.chat_input` / `st.chat_message`, backed by `st.session_state`): the conversation persists as a scrollable history rather than resetting on every question. Note that **each question is still retrieved independently** — the retriever doesn't currently use prior turns as context, so a follow-up like "what about women specifically?" won't automatically inherit the topic of the previous question.
 
 # Models used
 
 | Purpose | Model | Where it runs | Why |
 |---|---|---|---|
 | Embeddings | [`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (via `HuggingFaceEmbeddings` / `sentence-transformers`) | Locally, on CPU | Small, fast sentence-transformer (384-dim vectors) — no API cost, no external dependency for indexing the corpus. |
-| Chat / generation | Currently `openai/gpt-oss-20b`, called through `ChatGroq` | [Groq](https://console.groq.com/) API | Groq's LPU hardware gives very low-latency inference and has a generous free tier — good fit for a research tool with no budget. |
+| Chat / generation | Currently `openai/gpt-oss-20b`, called through `ChatGroq` | [Groq](https://console.groq.com/) API | Groq's LPU hardware gives very low-latency inference and has a generous free tier. |
 
 **Important — Groq's hosted model lineup changes over time**, and which models are available depends on your account. Models get decommissioned (e.g. this project originally used `llama3-8b-8192`, which no longer exists), and not every model on Groq's docs is necessarily enabled for every key. If you see a `model_decommissioned` or `model_not_found` error from `groq`, check what your key currently has access to before guessing a replacement name:
 
@@ -99,7 +99,7 @@ The unit tests cover the parts that can fail silently without an LLM: source for
 
 # Evaluation
 
-Getting an answer back from the chatbot doesn't tell you whether that answer is any good: RAG can fail silently in two independent places. Retrieval can pull the wrong passages, or the LLM can state things the retrieved passages don't support, even when retrieval worked. [`eval/evaluate.py`](eval/evaluate.py) runs the real `rag_chain` (the code the app uses, via `rag_pipeline.py`) against [`eval/testset.py`](eval/testset.py): 20 questions over the 4 public PDFs, each with a reference answer written from the source text and the PDF page it comes from.
+[`eval/evaluate.py`](eval/evaluate.py) runs the real `rag_chain` (the code the app uses, via `rag_pipeline.py`) against [`eval/testset.py`](eval/testset.py): 20 questions over the 4 public PDFs, each with a reference answer written from the source text and the PDF page it comes from.
 
 It reports two layers of metrics:
 
