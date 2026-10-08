@@ -14,8 +14,8 @@ The pipeline, step by step (see `rag_pipeline.py`, shared by the Streamlit app a
 1. **Ingestion** — `DirectoryLoader` + `PyPDFLoader` (LangChain) read every PDF in the configured folder (see [Privacy](#privacy--ip) below), page by page.
 2. **Chunking** — `RecursiveCharacterTextSplitter` splits the extracted text into chunks of **500 characters with 50 characters of overlap**. Smaller chunks make retrieval more precise (less irrelevant text gets pulled in alongside the relevant part); the overlap prevents an idea from being cleanly severed at a chunk boundary.
 3. **Embedding** — each chunk is turned into a vector with a local embedding model (see [Models used](#models-used)), so no external API call or cost is needed for this step.
-4. **Indexing** — the vectors are stored in a local **ChromaDB** vector store, persisted to disk under `.chroma_cache/` so this step doesn't have to be repeated on every restart (see [Speeding up local testing](#speeding-up-local-testing)).
-5. **Retrieval** — when a question comes in, it's embedded with the same model and matched against the index to pull the top-k most similar chunks.
+4. **Indexing** — the vectors are stored in a local **ChromaDB** vector store, persisted to disk under `.chroma_cache/` so this step doesn't have to be repeated on every restart. The cache is tied to a fingerprint of the PDFs (names, sizes, modification times) and is rebuilt automatically when they change (see [Speeding up local testing](#speeding-up-local-testing)).
+5. **Retrieval** — when a question comes in, it's embedded with the same model and matched against the index to pull the top-k most similar chunks (`k=4`, LangChain's default, made explicit as `RETRIEVAL_K` in `rag_pipeline.py`).
 6. **Generation** — the retrieved chunks are "stuffed" directly into the system prompt as `{context}`, and an LLM (see [Models used](#models-used)) answers the question using only that context, listing which sources it used.
 7. **Source display** — each retrieved chunk carries metadata (source filename + page number), which the app deduplicates and displays under "Files accessed for this answer" so every answer is auditable against the literature.
 
@@ -54,7 +54,7 @@ uv sync
 Run `cp .env.example .env` and fill the necessary variables in `.env`:
 
 - `API_SERVICE_KEY` — retrieve an API key from [GROQ](https://console.groq.com/) (the free tier is quite generous).
-- `PRIVACY` — either `public` or `private`, **lowercase** (see [Privacy / IP](#privacy--ip) below). Any other value (including different casing, e.g. `PUBLIC`) silently falls through and the app will try to load PDFs directly from `pdf_papers/`, which is empty — you'll get a "no text could be extracted" error.
+- `PRIVACY` — either `public` or `private` (case-insensitive, see [Privacy / IP](#privacy--ip) below). Any other value, or a missing one, stops the app with an explicit configuration error.
 
 ## Pre-commit
 
@@ -79,9 +79,9 @@ This opens the app at `http://localhost:8501`. On first run, it downloads the em
 
 ## Speeding up local testing
 
-The vector index built in step 4 above is persisted to `.chroma_cache/<PRIVACY>/`. On subsequent runs, if a cache already exists for the current `PRIVACY` value, the app loads it directly instead of re-parsing and re-embedding every PDF — so the slow indexing step only happens once per corpus, not on every restart.
+The vector index built in step 4 above is persisted to `.chroma_cache/<PRIVACY>/chunk<size>_overlap<overlap>/`, next to a fingerprint of the PDF folder (file names, sizes and modification times, plus the embedding model name). On subsequent runs, if the fingerprint still matches, the app loads the index directly instead of re-parsing and re-embedding every PDF — so the slow indexing step only happens once per corpus, not on every restart. If you add, remove or modify a PDF, the fingerprint changes and the index is rebuilt automatically.
 
-If you change the contents of `pdf_papers/` and want the index rebuilt, delete the relevant cache folder before restarting:
+The check is deliberately cheap (it doesn't hash file contents), so it can occasionally trigger a rebuild for a file that was only re-saved with the same content; it can't serve a stale index. To force a rebuild anyway:
 
 ```bash
 rm -rf .chroma_cache/public   # or .chroma_cache/private
@@ -89,51 +89,98 @@ rm -rf .chroma_cache/public   # or .chroma_cache/private
 
 For quick iteration on the app itself (not the retrieval quality), testing with `PRIVACY=public` is by far the fastest option, since the corpus is tiny.
 
+## Tests
+
+```bash
+uv run pytest
+```
+
+The unit tests cover the parts that can fail silently without an LLM: source formatting (including chunks with no page metadata), `PRIVACY` validation, and the cache-invalidation fingerprint.
+
 # Evaluation
 
-Getting an answer back from the chatbot doesn't tell you whether that answer is any good — RAG can silently fail in two independent places: retrieval can pull the wrong passages, or the LLM can generate an answer not actually supported by the passages it was given (hallucination), even when retrieval worked fine. [`eval/evaluate.py`](eval/evaluate.py) runs the real `rag_chain` (the same code the app uses, via `rag_pipeline.py`) against a small hand-written gold question set ([`eval/testset.py`](eval/testset.py)) grounded in `pdf_papers/public/`, and scores it with four [RAGAS](https://github.com/explodinggradients/ragas) metrics:
+Getting an answer back from the chatbot doesn't tell you whether that answer is any good: RAG can fail silently in two independent places. Retrieval can pull the wrong passages, or the LLM can state things the retrieved passages don't support, even when retrieval worked. [`eval/evaluate.py`](eval/evaluate.py) runs the real `rag_chain` (the code the app uses, via `rag_pipeline.py`) against [`eval/testset.py`](eval/testset.py): 20 questions over the 4 public PDFs, each with a reference answer written from the source text and the PDF page it comes from.
+
+It reports two layers of metrics:
+
+**1. Retrieval metrics, no LLM involved** (deterministic, free, work with `--retrieval-only` and no API key):
+
+| Metric | Meaning |
+|---|---|
+| `page_hit` | Share of questions for which a chunk from the expected PDF page was retrieved |
+| `source_hit` | Same, at PDF level (weak with only 4 PDFs: it is easy to hit the right file) |
+| `context_chars` | Average size of the retrieved context, a proxy for tokens sent to the LLM |
+
+**2. [RAGAS](https://github.com/explodinggradients/ragas) metrics, scored by an LLM judge:**
 
 | Metric | Answers |
 |---|---|
-| `faithfulness` | Does the answer only assert things actually supported by the retrieved context? (catches hallucination) |
+| `faithfulness` | Does the answer only assert things supported by the retrieved context? (catches hallucination) |
 | `answer_relevancy` | Does the answer actually address the question asked? |
 | `context_precision` | Is the retrieved context relevant to the question, with the most useful chunks ranked first? |
-| `context_recall` | Did retrieval surface the information needed to produce a correct answer? |
-
-Run it with:
+| `context_recall` | Did retrieval surface the information needed to produce the reference answer? |
 
 ```bash
-uv run python eval/evaluate.py
+uv run python eval/evaluate.py                                   # baseline: 500/50 chunks, k=4, all four RAGAS metrics
+uv run python eval/evaluate.py --chunk-size 250 --k 4            # another configuration
+uv run python eval/evaluate.py --retrieval-only --k 8            # retrieval metrics only, no LLM, no API key
+uv run python eval/evaluate.py --metrics context_precision,context_recall   # cheaper judge run
+uv run python eval/compare.py eval/results/*.json                # before/after tables
+```
+
+Each run writes `eval/results/<label>.json` (gitignored): the configuration, a summary, and for each question the answer, the retrieved chunks and the scores. It does not store the judge's reasoning.
+
+## Measured iteration: chunk size and k
+
+The baseline uses 500-character chunks (50 overlap) and `k=4`. I swept three chunk sizes and two values of `k` with the retrieval metrics (20 questions, no LLM):
+
+| chunk size / overlap | k | page hit | source hit | context chars |
+|---|---|---|---|---|
+| 250 / 25 | 4 | 0.95 | 1.00 | 847 |
+| 250 / 25 | 8 | 0.95 | 1.00 | 1741 |
+| **500 / 50 (baseline)** | **4** | **0.90** | **1.00** | **1821** |
+| 500 / 50 | 8 | 0.95 | 1.00 | 3668 |
+| 1000 / 100 | 4 | 0.90 | 1.00 | 3773 |
+| 1000 / 100 | 8 | 0.95 | 1.00 | 7607 |
+
+What this shows, and what it doesn't:
+
+- **The gaps in `page_hit` are one question out of 20**, which is noise. I did not change the defaults on this evidence.
+- **Cost is the clearer signal.** The context sent to the LLM grows with chunk size times `k`. 250/k=4 reaches the same `page_hit` as 500/k=8 with about a quarter of the context, and as the baseline with about half. This is the configuration to validate next.
+- **`page_hit` is necessary, not sufficient.** It says the right page was retrieved, not that the retrieved chunk contains the answer. Checking that is the job of RAGAS `context_recall` and `context_precision`.
+- **One question is missed by every configuration**: the share of bisexual and lesbian women with alcohol dependence, whose answer is in a table on page 4. Text extracted from a PDF table embeds badly, so changing chunk size or `k` doesn't help; it needs table-aware extraction.
+
+## RAGAS results so far
+
+I don't have a RAGAS before/after yet. What I have:
+
+- **A partial baseline.** On the first full run (baseline configuration), the judge's daily quota ran out after 10 of the 20 questions. On those 10: `faithfulness` 0.81 (scored on only 6 of them), `answer_relevancy` 0.92, `context_precision` 0.69, `context_recall` 0.55. Treat these as indicative.
+- **Why it stopped.** The judge model (below) has a free-tier quota of 200,000 tokens per day, and scoring all four metrics costs about 20,000 tokens per question, retries included. A full run on 20 questions therefore doesn't fit in one day, let alone a before/after pair. The quota appears to refill gradually rather than at once.
+- **What the harness does about it now.** `--metrics` lets you score only `context_precision` and `context_recall`, which are the ones a retrieval change affects, for about 4,000 tokens per question. When the daily quota is exhausted the run stops cleanly and records the remaining questions as `n/a`; per-minute limits are waited out for the delay Groq asks for; a misconfigured judge model fails loudly instead of producing `n/a`. `eval/compare.py` compares configurations on the questions that were scored in every run, so judge failures don't bias the averages.
+
+The next step is to run, on a day with a fresh quota:
+
+```bash
+uv run python eval/evaluate.py --metrics context_precision,context_recall
+uv run python eval/evaluate.py --chunk-size 250 --metrics context_precision,context_recall
+uv run python eval/compare.py eval/results/chunk500_k4.json eval/results/chunk250_k4.json
 ```
 
 ## Judge model
 
-RAGAS needs an LLM to *judge* the RAG chain's answers — a separate role from the chat model being evaluated. It's tempting to reuse the same Groq model the app uses (`openai/gpt-oss-20b`), but that model turned out to be an unreliable judge: `gpt-oss` is a reasoning model, and on RAGAS' stricter structured-output schemas it would intermittently leak its chain-of-thought into the response instead of emitting a clean tool call, failing anywhere from 1 in 3 to 3 in 3 attempts depending on the metric. `qwen/qwen3.8-27b` was tested and found reliable (identical scores across repeated runs of all four metrics), so it's used as the judge instead — a good general lesson: **the judge model matters as much as the model being evaluated, and needs its own reliability check**, not just a hope that "any chat model" can fill that role. See the comments in `eval/evaluate.py::build_judge_llm` for the exact `instructor` mode this required.
+RAGAS needs an LLM to *judge* the RAG chain's answers, a separate role from the chat model being evaluated. Reusing the app's model (`openai/gpt-oss-20b`) fails: `gpt-oss` is a reasoning model, and on RAGAS' structured-output schemas it intermittently leaks its chain-of-thought into the response instead of emitting a clean tool call. `openai/gpt-oss-120b` behaves the same way: re-tested on the two simple retrieval metrics only, it failed about 80% of calls. `qwen/qwen3.8-27b` is the only model on this account that was reliable (identical scores across repeated runs), so it is the default judge (`--judge-model`). **The judge model matters as much as the model being evaluated, and needs its own reliability check.** See `eval/evaluate.py::build_judge_llm` for the exact `instructor` mode this required, and note that the model lineup on a Groq account changes over time (a second Qwen model that worked in September is gone).
 
-## Known constraints of running this on a free tier
+Two more constraints of the free tier are handled in `eval/evaluate.py`: the output of a judge call is capped at about 1,000 tokens, which truncates `faithfulness` on long answers (those show up as `n/a`), and Groq occasionally answers every request with a `403` that clears up later (see "Tech challenges").
 
-- **Output-token budget**: some longer, more information-dense answers require the judge to decompose many atomic statements (each with a verdict and reasoning), which can exceed this Groq account's free-tier output-tokens-per-minute limit for the judge model. When a metric can't be scored after a few retries, the harness records it as `n/a` and excludes it from the averages rather than crashing the whole run — see `score_with_retries` in `eval/evaluate.py`.
-- **Transient network blocks**: this project occasionally hits a `403 Access denied` from Groq that clears up on its own after a while (see the "Tech challenges" section for the same issue affecting the app itself). If a run fails outright with this error, it's Groq/network, not the harness — just retry later.
+# Limitations and next steps
 
-## Sample output
-
-From a real run against the public corpus (your own numbers will vary slightly, since the judge is itself an LLM):
-
-```
-Q: How much higher is the rate of alcoholism among Native Americans compared to the U.S. average?
-  faithfulness       1.000
-  answer_relevancy   0.926
-  context_precision  1.000
-  context_recall     0.500
-
-Q: Why does women's drinking warrant serious attention from researchers even though women consume less alcohol than men?
-  faithfulness       0.400
-  answer_relevancy   0.798
-  context_precision  1.000
-  context_recall     1.000
-```
-
-That `context_recall: 0.500` and `faithfulness: 0.400` are genuinely useful signal, not just numbers to wave at — they're pointing at real, inspectable weaknesses: a `context_recall` below 1.0 means the retriever didn't surface every fact needed to fully answer that question (a chunking/retrieval-tuning problem), while a low `faithfulness` means the LLM asserted something in its answer that the retrieved chunks didn't actually support (a prompting/hallucination problem) — and `eval/results.json` (written after each run) has the full per-statement judge reasoning behind every score, so you can go read exactly which claim failed and why instead of guessing.
+- **No conversational memory in retrieval.** Each question is retrieved on its own. The standard fix is a history-aware retriever that rewrites a follow-up ("and for women?") into a standalone question using the chat history before searching.
+- **Basic retrieval.** Dense search only, with `all-MiniLM-L6-v2`, an English-centric model, while the private corpus also contains French books. Next steps would be a multilingual embedding model, hybrid (BM25 + dense) search and a reranker. The public gold set is English-only, so it can't measure the multilingual gain.
+- **Tables are poorly retrieved.** The retrieval metrics show one question that no configuration answers: its answer sits in a table, and text extracted from a PDF table embeds badly. Table-aware extraction would be needed.
+- **Small evaluation set.** 20 questions over 4 PDFs: a difference of one question is within noise, so the comparisons in the Evaluation section are indications, not proof.
+- **Legacy LangChain chains.** `langchain_classic` chains were the quickest way to iterate. For multi-turn behaviour I would migrate to LCEL or LangGraph.
+- **Generation is remote.** Embeddings and indexing run locally on CPU (and are cached), but the answer itself comes from a hosted model (Groq).
+- **Streamlit only.** No HTTP API, CI, container or monitoring yet.
 
 # Tech challenges
 
