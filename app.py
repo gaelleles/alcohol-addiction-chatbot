@@ -7,7 +7,7 @@ import rag_pipeline
 
 load_dotenv()
 
-st.set_page_config(page_title="DS Research Assistant", layout="wide")
+st.set_page_config(page_title="Research Assistant", layout="wide")
 
 # --- CONFIGURATION ---
 API_SERVICE_KEY = os.getenv("API_SERVICE_KEY")

@@ -7,7 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "chromadb>=1.4.0",
     "cryptography>=50.0.1",
-    "faiss-cpu>=1.13.2",
     "groq>=0.37.1",
     "langchain>=1.2.0",
     "langchain-community>=0.4.1",
