@@ -103,6 +103,7 @@ def build_vectorstore(
     loader = DirectoryLoader(pdf_directory, glob="./*.pdf", loader_cls=PyPDFLoader)
     documents = loader.load()
 
+    # TODO : Split by token rather than characters
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap
     )
